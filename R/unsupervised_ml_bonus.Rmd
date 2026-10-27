@@ -1,0 +1,180 @@
+---
+title: "An nitro to unsupervised machine learning"
+subtitle: "3DLab Crash Course on Unsupervised Machine Learning in R"
+date: "`r format(Sys.Date(), '%B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 2
+    theme: flatly
+    highlight: tango
+    df_print: paged
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 6.5, fig.height = 4.4, fig.align = "center")
+```
+
+## The other half
+
+Everything in the main tutorial was *supervised*: every grass plant had a known `uptake`, and we trained models to predict it. The whole discipline was *split → fit → score*, because we always had an answer to score against.
+
+But what if you have measurements and **no answer to aim at**? You have no label, no target, and nothing to hold out. That's *unsupervised* learning, and its job isn't to predict, but to **find structure**. Does the data fall into natural groups? Are these groups distinct?
+
+Let's watch it work, using a dataset where we secretly *do* know the answer, so we can check whether the machine got it right.
+
+```{r packages}
+# install.packages("palmerpenguins")
+library(palmerpenguins)
+library(ggplot2)
+```
+
+## The data: penguins, with the labels hidden
+
+We have four body measurements for 333 penguins. We *also* know each one's species, but we're going to **hide that** and see whether a machine can recover the groups on its own, from the measurements alone.
+
+```{r data}
+p <- na.omit(penguins[, c("species", "bill_length_mm", "bill_depth_mm",
+                          "flipper_length_mm", "body_mass_g")])
+X <- scale(p[, -1])   # scale: put all four measurements on a comparable footing
+head(round(X, 2))
+```
+
+A quick note on that `scale()`: k-means measures *distance* between penguins, and body mass (grams, in the thousands) would otherwise drown out bill depth (millimetres). Scaling lets every measurement speak equally — itself a small piece of feature engineering.
+
+## Step 1 — find groups with k-means
+
+`k-means` is the workhorse of clustering. You tell it *how many* groups to look for (here, 3), and it sorts every penguin into the nearest group based on the measurements alone. No species, no labels: it has never heard the word "penguin".
+
+```{r kmeans}
+set.seed(42)
+km <- kmeans(X, centers = 3, nstart = 25)
+table(cluster = km$cluster)   # three groups, sizes only — we don't know what they ARE yet
+```
+
+## Step 2 — see it, with PCA
+
+Four measurements is one too many dimensions to plot. **PCA** squeezes them onto two axes that capture most of the variation, so we can actually look at the groups the machine made.
+
+```{r pca}
+pc <- prcomp(X)
+round(summary(pc)$importance[2, 1:2], 3)   # variance captured by PC1, PC2
+```
+
+```{r pca-plot, fig.height=4.6}
+viz <- data.frame(PC1 = pc$x[, 1], PC2 = pc$x[, 2],
+                  cluster = factor(km$cluster), species = p$species)
+
+ggplot(viz, aes(PC1, PC2, colour = cluster)) +
+  geom_point(size = 2, alpha = 0.8) +
+  labs(title = "What the machine found: three groups, no labels used",
+       colour = "k-means\ncluster") +
+  theme_minimal()
+```
+
+Two axes hold about **88%** of the variation, so this flat picture is honest. The machine found three data blobs. But are they *anything*, or did it just carve the cloud into three?
+
+## The reveal
+
+Now bring back the species we hid, and colour the *same* points by their true identity:
+
+```{r reveal, fig.height=4.6}
+ggplot(viz, aes(PC1, PC2, colour = species)) +
+  geom_point(size = 2, alpha = 0.8) +
+  labs(title = "The truth we hid: the actual species",
+       colour = "true\nspecies") +
+  theme_minimal()
+```
+
+```{r accuracy}
+tab <- table(cluster = km$cluster, species = p$species)
+tab
+round(sum(apply(tab, 1, max)) / sum(tab), 3)   # how often cluster == species
+```
+
+Look at the two plots side by side: they're nearly the same picture. The machine found three groups from body measurements alone, and they line up with the real species about **92%** of the time. **Gentoo** separate cleanly; the only real confusion is between **Adelie** and **Chinstrap**, which genuinely overlap in body shape. We never told it "species" — it rediscovered them from structure.
+
+## How do you know it worked?
+
+Here's the catch that makes unsupervised learning *fundamentally* different from the main tutorial. We just **cheated**: we had the true species to check against. Normally, in a real unsupervised problem, **you don't**. There is no answer to hold out, so there's no test set, and you *cannot* score the model the way we scored the forest.
+
+So how do you judge it? By whether the structure is **useful and interpretable**: do the groups make biological sense? Are they stable if you re-run with a different seed or a different `k`? Do they help your next question? That's a softer, more subjective bar, and it's exactly the reason why the tidy *split → fit → score* pipeline from the main tutorial doesn't apply here. Different question, different rules.
+
+## The same workflow, in tidymodels
+
+Just like in the main tutorial, there's a tidy grammar for all of this. Dimensionality reduction lives in **recipes** (as a preprocessing step), and clustering lives in **tidyclust**, the tidymodels clustering extension, with the same `fit()` feel as the models you already met.
+
+```{r tidymodels-unsup, eval=FALSE}
+library(tidymodels)
+library(tidyclust)   # install.packages("tidyclust") = the clustering add-on
+
+# PCA, the recipes way: normalise, then reduce to 2 components
+pca_rec <- recipe(~ bill_length_mm + bill_depth_mm + flipper_length_mm + body_mass_g,
+                  data = tidyr::drop_na(penguins)) |>
+  step_normalize(all_numeric_predictors()) |>
+  step_pca(all_numeric_predictors(), num_comp = 2)
+
+pca_rec |> prep() |> bake(new_data = NULL)        # the PC scores, ready to plot
+
+# k-means, the tidyclust way (mirrors rand_forest(), decision_tree(), ...)
+#   normalise first in practice — e.g. inside a workflow with the recipe above
+km_spec <- k_means(num_clusters = 3) |> set_engine("stats")
+km_fit  <- km_spec |> fit(~ bill_length_mm + bill_depth_mm +
+                            flipper_length_mm + body_mass_g, data = penguins)
+extract_cluster_assignment(km_fit)                # the cluster label for each penguin
+```
+
+```{r recipes-pca, fig.height=4.6}
+library(recipes)
+
+peng_complete <- tidyr::drop_na(penguins)        # 333 rows, NA anywhere dropped
+
+# PCA, the recipes way: normalise, then reduce to 2 components
+pca_rec <- recipe(~ bill_length_mm + bill_depth_mm + flipper_length_mm + body_mass_g,
+                  data = peng_complete) |>
+  step_normalize(all_numeric_predictors()) |>
+  step_pca(all_numeric_predictors(), num_comp = 2)
+
+pca_scores <- pca_rec |> prep() |> bake(new_data = NULL)   # the PC scores
+pca_scores$species <- peng_complete$species               # bring back the labels we hid
+
+ggplot(pca_scores, aes(PC1, PC2, colour = species)) +
+  geom_point(size = 2, alpha = 0.8) +
+  labs(title = "PCA",
+       colour = "true\nspecies") +
+  theme_minimal()
+```
+
+Notice what's *missing*: there's no `metrics(truth = ...)` line, because there's no truth to compare against. That single absent line is the whole difference between the supervised workflow and this one.
+
+## More ways to find structure
+
+k-means and PCA are the entry points, not the whole story. A quick map of the neighbourhood, so you know what to reach for (and what to search):
+
+**Grouping things (clustering)**
+
+-   **k-means** = fast; assumes roundish groups of similar size; *you* pick the number of groups.
+-   **Hierarchical clustering** (`hclust`, or `hier_clust()` in tidyclust) — builds a tree (dendrogram), so you don't commit to a number up front.
+-   **DBSCAN** (`dbscan`) — groups by density, finds the number of clusters itself, and is happy to leave outliers ungrouped.
+-   **Gaussian mixture models** (`mclust`) = soft, probabilistic clusters (a penguin can be 70% group A, 30% group B).
+
+**Squeezing many variables into few (dimension reduction / ordination)**
+
+-   **PCA** = linear, fast, interpretable axes (what we used).
+-   **t-SNE / UMAP** (`Rtsne`, `uwot`) = non-linear, beautiful for visualising high-dimensional data, but the axes aren't interpretable distances.
+-   **NMDS / PCoA** (`vegan`) = ordination for community ecologists; same unsupervised spirit but built around ecological distance measures.
+
+Choosing among these is the same judgement call as choosing a supervised model: start simple (k-means, PCA), and reach for the fancier tools only when the simple one visibly fails your data.
+
+## Where this shows up in your work
+
+If you've ever run a **PCA**, an **ordination**, or clustered sites into community types, you were already doing unsupervised ML, you just may not have called it that. It also turns up as a *first step* before supervised modelling: reduce a hundred messy variables to a few clean axes, then predict. Same toolbox, used to explore rather than to predict.
+
+That's the other half of the map. The main tutorial taught you to *predict and check*; this taught you to *look for structure when there's nothing to check against*. Knowing which situation you're in is half the battle.
+
+```{r session, echo=FALSE}
+cat("Built with:\n"); print(R.version.string)
+```
